@@ -1,3 +1,7 @@
+/*
+ * XXX license?
+ */
+
 #include <nginx.h>
 #include <ngx_http.h>
 #include <ngx_http_variables.h>
