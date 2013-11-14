@@ -1,6 +1,7 @@
 /*
  * XXX license?
  */
+#include <stdlib.h>
 
 #include <nginx.h>
 #include <ngx_http.h>
@@ -9,7 +10,6 @@
 void	ngx_txid_base32_encode(unsigned char *dst, unsigned char *src, size_t n);
 size_t	ngx_txid_base32_encode_len(size_t n);
 
-static int		txid_dev_urandom = 0;
 static ngx_msec_t	txid_last_msec = 0;
 
 /*
@@ -26,100 +26,42 @@ ngx_txid_next_tick()
 	return (txid_last_msec);
 }
 
-/*
- * reads len bytes from the urandom dev into *buf, returns the
- * number of bytes of entropy bytes read
- */
-size_t
-ngx_txid_get_entropy(unsigned char *buf, const size_t len)
-{
-	size_t i = 0;
-	size_t n = len;
-	u_char *p = buf;
-	int retries = 32;
-
-	while (n > 0 && retries > 0) {
-		i = read(txid_dev_urandom, (void*)p, n);
-
-		/*
-		 * reading from urandom shouldn't ever block or be interrupted or
-		 * return less than the requested bytes.
-		 */
-		if (i <= 0) {
-			retries--;
-			continue;
-		}
-
-		p += i;
-		n -= i;
-	}
-
-	return (len - n);
-}
-
-/*
- * makes a roughly sortable identifier in at least 96 bytes.
- * +-------------64bit BE-----------remaining > 32 bits---+
- * | 42 bits msec | 22 bits rand | random...
- * +------------------------------------------------------+
- * returns <0 on failure
- */
-int
-ngx_txid_make(unsigned char *out, const size_t len)
-{
-	size_t n;
-	ngx_msec_t msec;
-
-	if (len < 12) {
-		// not enough entropy to avoid collisions
-		return (-1);
-	}
-
-	n = ngx_txid_get_entropy(out, len);
-	if (n < len) {
-		// not enough entropy in system
-		return (-1);
-	}
-
-	msec = ngx_txid_next_tick() << 22;
-	out[0] =  (msec >> 56) & 0xff;
-	out[1] =  (msec >> 48) & 0xff;
-	out[2] =  (msec >> 32) & 0xff;
-	out[3] =  (msec >> 16) & 0xff;
-	out[4] |= (msec >> 8)  & 0xff;  // share the 5th byte with entropy
-
-	return (0);
-}
-
 static ngx_int_t
 ngx_txid_get(ngx_http_request_t *r, ngx_http_variable_value_t *v,
     uintptr_t data)
 {
-	const size_t bits = 96;
-	const size_t len  = (bits+7)/8;
+	u_char rnd[12]; /* 96 bits */
+	ngx_msec_t msec;
+	u_char *out;
+	size_t len;
 
-	u_char rnd[len];
+	/*
+	 * makes a roughly sortable identifier in at least 96 bytes.
+	 * +-------------64bit BE-----------remaining > 32 bits---+
+	 * | 42 bits msec | 22 bits rand | random...
+	 * +------------------------------------------------------+
+	 */
+	arc4random_buf(rnd, sizeof(rnd));
+	msec = ngx_txid_next_tick() << 22;
 
-	if (ngx_txid_make(rnd, len) < 0) {
-		ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-		    "not enough entropy (want %d bytes) for \"$txid\"", len);
-		v->valid = 0;
-		v->not_found = 1;
-		return (NGX_ERROR);
-	}
+	rnd[0] = (msec >> 56) & 0xff;
+	rnd[1] = (msec >> 48) & 0xff;
+	rnd[2] = (msec >> 32) & 0xff;
+	rnd[3] = (msec >> 16) & 0xff;
+	rnd[4] |= (msec >> 8)  & 0xff;  // share the 5th byte with entropy
 
-	size_t enclen = ngx_txid_base32_encode_len(len);
+	len = ngx_txid_base32_encode_len(sizeof(rnd));
 
-	u_char *out = ngx_pnalloc(r->pool, enclen);
+	out = ngx_pnalloc(r->pool, len);
 	if (out == NULL) {
 		v->valid = 0;
 		v->not_found = 1;
 		return (NGX_ERROR);
 	}
 
-	ngx_txid_base32_encode(out, rnd, len);
+	ngx_txid_base32_encode(out, rnd, sizeof(rnd));
 
-	v->len = (bits + 4) / 5; /* strip any padding chars */
+	v->len = (sizeof(rnd) * 8 + 4) / 5; /* strip any padding chars */
 	v->data = out;
 
 	v->valid = 1;
@@ -132,16 +74,6 @@ ngx_txid_get(ngx_http_request_t *r, ngx_http_variable_value_t *v,
 static ngx_int_t
 ngx_txid_init_module(ngx_cycle_t *cycle)
 {
-	txid_dev_urandom = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-	if (txid_dev_urandom == -1) {
-		ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
-		    "could not open /dev/urandom device for \"$txid\"");
-		return (NGX_ERROR);
-	}
-
-	ngx_log_error(NGX_LOG_DEBUG, cycle->log, 0,
-	    "opened /dev/urandom %d for pid %d", txid_dev_urandom, ngx_pid);
-
 	return (NGX_OK);
 }
 
